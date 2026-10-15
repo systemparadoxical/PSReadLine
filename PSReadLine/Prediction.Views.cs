@@ -109,8 +109,8 @@ namespace Microsoft.PowerShell
             }
 
             /// <summary>
-            /// Get multiple suggestion results from histories, as long as a history is a single-line
-            /// command that contains the user input.
+            /// Get multiple suggestion results from histories, as long as a history command contains
+            /// the user input. Multiline commands are flattened only for display by SuggestionEntry.
             /// We favor history commands that are prefixed with the user input over those that contain
             /// the user input in the middle or at the end.
             /// </summary>
@@ -130,11 +130,12 @@ namespace Microsoft.PowerShell
 
                 for (int historyIndex = history.Count - 1; historyIndex >= 0; historyIndex--)
                 {
-                    var line = history[historyIndex].CommandLine.TrimEnd();
+                    HistoryItem historyEntry = history[historyIndex];
+                    var line = historyEntry.CommandLine.TrimEnd();
 
-                    // Skip the history command lines that are smaller in length than the user input,
-                    // or contain multiple logical lines.
-                    if (line.Length <= input.Length || _cacheHistorySet.Contains(line) || line.IndexOf('\n') != -1)
+                    // Skip history command lines that are smaller in length than the user input
+                    // or are already represented in this result set.
+                    if (line.Length <= input.Length || _cacheHistorySet.Contains(line))
                     {
                         continue;
                     }
@@ -150,7 +151,7 @@ namespace Microsoft.PowerShell
 
                     if (matchIndex == 0)
                     {
-                        results.Add(new SuggestionEntry(line, matchIndex));
+                        results.Add(new SuggestionEntry(line, matchIndex, historyEntry));
                         if (--remainingCount == 0)
                         {
                             break;
@@ -158,7 +159,7 @@ namespace Microsoft.PowerShell
                     }
                     else if (_cacheHistoryList.Count < remainingCount)
                     {
-                        _cacheHistoryList.Add(new SuggestionEntry(line, matchIndex));
+                        _cacheHistoryList.Add(new SuggestionEntry(line, matchIndex, historyEntry));
                     }
                 }
 
@@ -209,12 +210,10 @@ namespace Microsoft.PowerShell
         private class PredictionListView : PredictionViewBase
         {
             // Item count constants.
-            internal const int ListMaxCount = 50;
-            internal const int HistoryMaxCount = 10;
+            internal const int ListMaxCount = 4096;
+            internal const int HistoryMaxCount = 4096;
 
             // List view constants.
-            internal const int ListViewMaxHeight = 10;
-            internal const int ListViewMaxWidth = 100;
             internal const int TooltipMaxHeight = 4;
             internal const int SourceMaxWidth = 15;
 
@@ -332,16 +331,14 @@ namespace Microsoft.PowerShell
             private (int, int, int, bool) RefreshMaxViewSize()
             {
                 var console = _singleton._console;
-                int maxListWidth = Math.Min(console.BufferWidth, ListViewMaxWidth);
+                int maxListWidth = console.WindowWidth;
 
-                (int maxListHeight, int maxTooltipHeigth, bool moreCheck) = console.BufferHeight switch
-                {
-                    > ListViewMaxHeight * 2 => (ListViewMaxHeight, TooltipMaxHeight, false),
-                    > ListViewMaxHeight => (ListViewMaxHeight / 2, TooltipMaxHeight / 2, false),
-                    _ => (ListViewMaxHeight / 3, TooltipMaxHeight / 3, true)
-                };
+                // Use every visible row below the input, reserving one row for list metadata.
+                int inputBottom = _singleton.EndOfBufferPosition().Y;
+                int windowBottom = console.WindowTop + console.WindowHeight - 1;
+                int maxListHeight = Math.Max(1, windowBottom - inputBottom - 1);
 
-                return (maxListWidth, maxListHeight, maxTooltipHeigth, moreCheck);
+                return (maxListWidth, maxListHeight, TooltipMaxHeight, false);
             }
 
             /// <summary>
@@ -427,9 +424,9 @@ namespace Microsoft.PowerShell
             /// Aggregate the suggestion results from both the prediction API and the history.
             /// </summary>
             /// <remarks>
-            /// If the prediction source contains both the history and plugin, then we allocate 3
-            /// slots at most for history suggestions. The remaining slots are evenly distributed
-            /// to each predictor plugin.
+            /// If the prediction source contains both history and plugins, retain as many history
+            /// suggestions as can fit in the current list view. The remaining result capacity is
+            /// evenly distributed to each predictor plugin.
             /// </remarks>
             private void AggregateSuggestions()
             {
@@ -444,7 +441,7 @@ namespace Microsoft.PowerShell
                         _cacheList2 ??= new List<int>(); // This list holds the final number of suggestions that will be rendered for each of the predictors.
 
                         int pCount = 0;
-                        int hCount = Math.Min(3, _listItems.Count);
+                        int hCount = Math.Min(_maxViewHeight, _listItems.Count);
                         int remRows = ListMaxCount - hCount;
 
                         // Calculate the number of plugins that we need to handle,
@@ -623,6 +620,12 @@ namespace Microsoft.PowerShell
             /// </summary>
             internal override void RenderSuggestion(List<StringBuilder> consoleBufferLines, ref int currentLogicalLine)
             {
+                // The selected ListView entry becomes the actual edit buffer. A multiline
+                // selection can therefore change the number of physical rows occupied by the
+                // input without causing a new prediction query. Recalculate the available
+                // ListView geometry for every render.
+                (_listViewWidth, _maxViewHeight, _maxTooltipHeight, _checkOnHeight) = RefreshMaxViewSize();
+
                 if (_warnAboutSize || (_checkOnHeight && HeightIsTooSmall()))
                 {
                     _warningPrinted = true;
@@ -649,6 +652,13 @@ namespace Microsoft.PowerShell
                 {
                     return;
                 }
+
+                // The available height may have changed because the selected item changed the
+                // physical height of the edit buffer. Resize the current page before applying
+                // the usual selected-item positioning logic.
+                _listViewEnd = Math.Min(
+                    _listItems.Count,
+                    _listViewTop + _maxViewHeight);
 
                 // Create the metadata line.
                 RenderMetadataLine(NextBufferLine(consoleBufferLines, ref currentLogicalLine));
@@ -686,6 +696,14 @@ namespace Microsoft.PowerShell
                     _tooltipHeight = 0;
                 }
 
+                int commandLengthWidth = 1;
+                for (int i = _listViewTop; i < _listViewEnd; i++)
+                {
+                    commandLengthWidth = Math.Max(
+                        commandLengthWidth,
+                        _listItems[i].SuggestionText.Length.ToString().Length);
+                }
+
                 for (int i = _listViewTop; i < _listViewEnd; i++)
                 {
                     bool itemSelected = i == _selectedIndex;
@@ -696,7 +714,8 @@ namespace Microsoft.PowerShell
                         .Append(entry.GetListItemText(
                             _listViewWidth,
                             _inputText,
-                            selectionColor));
+                            selectionColor,
+                            commandLengthWidth));
 
                     if (_singleton._options.ShowToolTips && itemSelected && !string.IsNullOrWhiteSpace(entry.ToolTip))
                     {
@@ -1115,6 +1134,97 @@ namespace Microsoft.PowerShell
                 _listViewWidth = _listViewHeight = _tooltipHeight = -1;
                 _listViewTop = _listViewEnd = _selectedIndex = -1;
                 _warnAboutSize = _checkOnHeight = _updatePending = _renderFromSelected = false;
+            }
+
+            private void RebuildSources()
+            {
+                _sources ??= new List<SourceInfo>();
+                _sources.Clear();
+
+                if (_listItems is null || _listItems.Count == 0)
+                {
+                    return;
+                }
+
+                int start = 0;
+                int previousEnd = -1;
+
+                while (start < _listItems.Count)
+                {
+                    string source = _listItems[start].Source;
+                    int end = start;
+
+                    while (
+                        end + 1 < _listItems.Count &&
+                        string.Equals(
+                            _listItems[end + 1].Source,
+                            source,
+                            StringComparison.Ordinal))
+                    {
+                        end++;
+                    }
+
+                    _sources.Add(
+                        new SourceInfo(
+                            source,
+                            endIndex: end,
+                            prevSourceEndIndex: previousEnd));
+
+                    previousEnd = end;
+                    start = end + 1;
+                }
+            }
+
+            internal bool DeleteSelectedHistoryItem(out string replacementText)
+            {
+                replacementText = null;
+
+                if (
+                    _listItems is null ||
+                    _selectedIndex < 0 ||
+                    _selectedIndex >= _listItems.Count)
+                {
+                    return false;
+                }
+
+                HistoryItem historyEntry = _listItems[_selectedIndex].HistoryEntry;
+
+                // Predictor/plugin suggestions aren't PSReadLine history and therefore
+                // cannot be deleted this way.
+                if (historyEntry is null)
+                {
+                    return false;
+                }
+
+                if (!_singleton.RemoveHistoryItem(historyEntry))
+                {
+                    return false;
+                }
+
+                int removedIndex = _selectedIndex;
+                _listItems.RemoveAt(removedIndex);
+
+                RebuildSources();
+
+                if (_listItems.Count == 0)
+                {
+                    string originalInput = _inputText;
+                    Reset();
+                    replacementText = originalInput;
+                    return true;
+                }
+
+                // Keep selection at the same visual position where possible.
+                // If we deleted the final item, select the new final item.
+                _selectedIndex = Math.Min(removedIndex, _listItems.Count - 1);
+
+                // Preserve the current list rather than launching a fresh prediction
+                // query when ReplaceSelection renders the newly selected item.
+                _updatePending = true;
+                _renderFromSelected = false;
+
+                replacementText = _listItems[_selectedIndex].SuggestionText;
+                return true;
             }
 
             /// <summary>

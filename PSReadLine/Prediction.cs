@@ -183,6 +183,27 @@ namespace Microsoft.PowerShell
         }
 
         /// <summary>
+        /// Delete the currently selected history suggestion from PSReadLine's
+        /// in-memory history and persistent history file.
+        /// </summary>
+        public static void DeleteHistorySuggestion(
+            ConsoleKeyInfo? key = null,
+            object arg = null)
+        {
+            if (
+                _singleton._prediction.ActiveView is PredictionListView listView &&
+                listView.HasActiveSuggestion &&
+                listView.DeleteSelectedHistoryItem(out string replacementText))
+            {
+                _singleton._visualSelectionCommandCount = 0;
+                ReplaceSelection(replacementText);
+                return;
+            }
+
+            Ding();
+        }
+
+        /// <summary>
         /// Show the tooltip of the currently selected list item in the full view.
         /// </summary>
         public static void ShowFullPredictionTooltip(ConsoleKeyInfo? key = null, object arg = null)

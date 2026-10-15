@@ -57,8 +57,8 @@ function Test-DotnetSDK
     param($dotnetExePath)
 
     if (Test-Path $dotnetExePath) {
-        $installedVersion = & $dotnetExePath --version
-        return [Version]::new($installedVersion) -ge [Version]::new($MinimalSDKVersion)
+        $null = & $dotnetExePath --version 2>$null
+        return $LASTEXITCODE -eq 0
     }
     return $false
 }

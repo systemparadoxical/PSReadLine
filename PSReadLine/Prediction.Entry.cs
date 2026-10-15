@@ -1,5 +1,7 @@
 /********************************************************************++
-Copyright (c) Microsoft Corporation.  All rights reserved.
+
+Copyright (c) Microsoft Corporation. All rights reserved.
+
 --********************************************************************/
 
 using System;
@@ -22,6 +24,7 @@ namespace Microsoft.PowerShell
             internal SourceInfo(string sourceName, int endIndex, int prevSourceEndIndex)
             {
                 SourceName = sourceName;
+
                 int sourceWidth = LengthInBufferCells(SourceName);
                 if (sourceWidth > PredictionListView.SourceMaxWidth)
                 {
@@ -44,22 +47,45 @@ namespace Microsoft.PowerShell
             internal const char Ellipsis = '\u2026';
             internal const string HistorySource = "History";
 
+            // Use a private-use sentinel during width/truncation calculations so an embedded
+            // newline occupies exactly one display cell. It is replaced with a bright glyph
+            // only after layout has been calculated.
+            private const char NewLineSentinel = '\uE000';
+            private const char NewLineGlyph = '\u21B5'; // ↵
+
             internal readonly Guid PredictorId;
             internal readonly uint? PredictorSession;
             internal readonly string Source;
             internal readonly string ToolTip;
             internal readonly string SuggestionText;
             internal readonly int InputMatchIndex;
-
-            private string _listItemTextRegular;
-            private string _listItemTextSelected;
+            internal readonly HistoryItem HistoryEntry;
 
             internal SuggestionEntry(string suggestion, int matchIndex)
-                : this(source: HistorySource, predictorId: Guid.Empty, predictorSession: null, suggestion, tooltip: null, matchIndex)
+                : this(suggestion, matchIndex, historyEntry: null)
             {
             }
 
-            internal SuggestionEntry(string source, Guid predictorId, uint? predictorSession, string suggestion, string tooltip, int matchIndex)
+            internal SuggestionEntry(string suggestion, int matchIndex, HistoryItem historyEntry)
+                : this(
+                    source: HistorySource,
+                    predictorId: Guid.Empty,
+                    predictorSession: null,
+                    suggestion: suggestion,
+                    tooltip: null,
+                    matchIndex: matchIndex,
+                    historyEntry: historyEntry)
+            {
+            }
+
+            internal SuggestionEntry(
+                string source,
+                Guid predictorId,
+                uint? predictorSession,
+                string suggestion,
+                string tooltip,
+                int matchIndex,
+                HistoryItem historyEntry = null)
             {
                 Source = source;
                 PredictorId = predictorId;
@@ -67,48 +93,296 @@ namespace Microsoft.PowerShell
                 SuggestionText = suggestion;
                 ToolTip = tooltip;
                 InputMatchIndex = matchIndex;
-
-                _listItemTextRegular = _listItemTextSelected = null;
+                HistoryEntry = historyEntry;
             }
 
             /// <summary>
-            /// Helper method to get the rounded-up result of a division.
+            /// Convert CR, LF, or CRLF to a single-cell sentinel and translate the match index
+            /// from the original command into the flattened display string.
             /// </summary>
-            private static int DivideAndRoundUp(int dividend, int divisor)
+            private static string FlattenForDisplay(string text, int matchIndex, out int displayMatchIndex)
             {
-                return (dividend + divisor - 1) / divisor;
+                if (text.IndexOfAny(new[] { '\r', '\n' }) is -1)
+                {
+                    displayMatchIndex = matchIndex;
+                    return text;
+                }
+
+                var display = new StringBuilder(text.Length);
+                displayMatchIndex = matchIndex < 0 ? -1 : 0;
+
+                for (int i = 0; i < text.Length; i++)
+                {
+                    if (i == matchIndex)
+                    {
+                        displayMatchIndex = display.Length;
+                    }
+
+                    char ch = text[i];
+                    if (ch == '\r')
+                    {
+                        if (i + 1 < text.Length && text[i + 1] == '\n')
+                        {
+                            i++;
+                        }
+
+                        display.Append(NewLineSentinel);
+                    }
+                    else if (ch == '\n')
+                    {
+                        display.Append(NewLineSentinel);
+                    }
+                    else
+                    {
+                        display.Append(ch);
+                    }
+                }
+
+                if (matchIndex == text.Length)
+                {
+                    displayMatchIndex = display.Length;
+                }
+
+                return display.ToString();
+            }
+
+            /// <summary>
+            /// Append one display range, rendering flattened newline sentinels as a bright glyph.
+            /// </summary>
+            private static void AppendDisplayRange(
+                StringBuilder line,
+                string text,
+                int start,
+                int length,
+                object style,
+                string selectionHighlighting,
+                string newlineStyle)
+            {
+                if (length <= 0)
+                {
+                    return;
+                }
+
+                int end = start + length;
+                int current = start;
+
+                if (style is not null)
+                {
+                    line.Append(style);
+                }
+
+                while (current < end)
+                {
+                    int newline = text.IndexOf(NewLineSentinel, current, end - current);
+                    if (newline < 0)
+                    {
+                        line.Append(text, current, end - current);
+                        break;
+                    }
+
+                    if (newline > current)
+                    {
+                        line.Append(text, current, newline - current);
+                    }
+
+                    if (style is not null)
+                    {
+                        line.EndColorSection(selectionHighlighting);
+                    }
+
+                    line.Append(newlineStyle)
+                        .Append(NewLineGlyph)
+                        .EndColorSection(selectionHighlighting);
+
+                    if (style is not null)
+                    {
+                        line.Append(style);
+                    }
+
+                    current = newline + 1;
+                }
+
+                if (style is not null)
+                {
+                    line.EndColorSection(selectionHighlighting);
+                }
+            }
+
+            /// <summary>
+            /// Append a slice of display text while preserving highlighting for the user-input match.
+            /// </summary>
+            private static void AppendDisplaySlice(
+                StringBuilder line,
+                string displayText,
+                int start,
+                int length,
+                int matchIndex,
+                int matchLength,
+                string selectionHighlighting,
+                string newlineStyle)
+            {
+                int end = start + length;
+                int matchEnd = matchIndex < 0 ? -1 : matchIndex + matchLength;
+
+                if (matchIndex < 0 || matchEnd <= start || matchIndex >= end)
+                {
+                    AppendDisplayRange(
+                        line,
+                        displayText,
+                        start,
+                        length,
+                        null,
+                        selectionHighlighting,
+                        newlineStyle);
+                    return;
+                }
+
+                int highlightStart = Math.Max(start, matchIndex);
+                int highlightEnd = Math.Min(end, matchEnd);
+
+                AppendDisplayRange(
+                    line,
+                    displayText,
+                    start,
+                    highlightStart - start,
+                    null,
+                    selectionHighlighting,
+                    newlineStyle);
+
+                AppendDisplayRange(
+                    line,
+                    displayText,
+                    highlightStart,
+                    highlightEnd - highlightStart,
+                    _singleton._options.EmphasisColor,
+                    selectionHighlighting,
+                    newlineStyle);
+
+                AppendDisplayRange(
+                    line,
+                    displayText,
+                    highlightEnd,
+                    end - highlightEnd,
+                    null,
+                    selectionHighlighting,
+                    newlineStyle);
+            }
+
+            /// <summary>
+            /// Choose a single-line slice that keeps the input match visible when truncation is required.
+            /// </summary>
+            private static (int Start, int Length, bool LeadingEllipsis, bool TrailingEllipsis) GetDisplayWindow(
+                string text,
+                int matchIndex,
+                int matchLength,
+                int width)
+            {
+                int totalWidth = LengthInBufferCells(text);
+                if (totalWidth <= width)
+                {
+                    return (0, text.Length, false, false);
+                }
+
+                if (width <= 1)
+                {
+                    int length = SubstringLengthByCells(text, 1);
+                    return (0, length, false, length < text.Length);
+                }
+
+                if (matchIndex <= 0)
+                {
+                    int length = SubstringLengthByCells(text, width - 1);
+                    return (0, length, false, length < text.Length);
+                }
+
+                int matchEnd = Math.Min(text.Length, matchIndex + matchLength);
+                int matchWidth = LengthInBufferCells(text, matchIndex, matchEnd);
+
+                bool mayClipLeft = matchIndex > 0;
+                bool mayClipRight = matchEnd < text.Length;
+                int ellipsisWidth = (mayClipLeft ? 1 : 0) + (mayClipRight ? 1 : 0);
+                int contentWidth = Math.Max(1, width - ellipsisWidth);
+
+                if (matchWidth >= contentWidth)
+                {
+                    int length = SubstringLengthByCells(text, matchIndex, contentWidth);
+                    int end = matchIndex + length;
+                    return (matchIndex, length, mayClipLeft, end < text.Length);
+                }
+
+                int contextWidth = contentWidth - matchWidth;
+                int leftBudget = contextWidth / 2;
+                int rightBudget = contextWidth - leftBudget;
+
+                int leftLength = leftBudget > 0
+                    ? SubstringLengthByCellsFromEnd(text, matchIndex - 1, leftBudget)
+                    : 0;
+
+                int rightLength = rightBudget > 0 && matchEnd < text.Length
+                    ? SubstringLengthByCells(text, matchEnd, rightBudget)
+                    : 0;
+
+                int start = matchIndex - leftLength;
+                int endIndex = matchEnd + rightLength;
+
+                // If one side had less text than its budget, spend the unused cells on the other side.
+                int usedWidth = LengthInBufferCells(text, start, endIndex);
+                int spareWidth = contentWidth - usedWidth;
+                if (spareWidth > 0 && start > 0)
+                {
+                    int extraLeft = SubstringLengthByCellsFromEnd(text, start - 1, spareWidth);
+                    start -= extraLeft;
+                    spareWidth -= LengthInBufferCells(text, start, start + extraLeft);
+                }
+
+                if (spareWidth > 0 && endIndex < text.Length)
+                {
+                    int extraRight = SubstringLengthByCells(text, endIndex, spareWidth);
+                    endIndex += extraRight;
+                }
+
+                return (
+                    start,
+                    endIndex - start,
+                    LeadingEllipsis: start > 0,
+                    TrailingEllipsis: endIndex < text.Length);
             }
 
             /// <summary>
             /// Generate the list item text to be rendered for the list view.
             /// </summary>
             /// <remarks>
-            /// The list item text is in this format:
-            ///  {> --------------------ITEM TEXT-------------------- [SOURCE]}
-            /// The leading character '>' and the 'SOURCE' portion are rendered with the configured metadata color (ListPredictionColor).
-            /// When the 'ITEM TEXT' portion contains the user input, the matching part will be rendered with the configured emphasis color.
-            /// When the current suggestion entry is selected in the list view, the whole line is rendered with the configured highlighting color (ListPredictionSelectedColor).
+            /// The list item text is rendered in this form:
+            ///
+            ///   &gt; LENGTH │ ---------------- ITEM TEXT ---------------- [SOURCE]
+            ///
+            /// Multiline commands remain unchanged in the actual suggestion text but are flattened
+            /// to one physical display row, with each logical newline shown as a bright '↵'.
             /// </remarks>
             /// <param name="width">The width of the list item.</param>
             /// <param name="input">The user input.</param>
-            /// <param name="selectionHighlighting">The highlighting sequences for a selected list item.</param>
-            internal string GetListItemText(int width, string input, string selectionHighlighting)
+            /// <param name="selectionHighlighting">The highlighting sequence for a selected list item.</param>
+            /// <param name="commandLengthWidth">Width of the aligned command-length field.</param>
+            internal string GetListItemText(
+                int width,
+                string input,
+                string selectionHighlighting,
+                int commandLengthWidth)
             {
                 const int ellipsisLength = 1;
 
-                if (selectionHighlighting is null)
-                {
-                    if (_listItemTextRegular is not null)
-                    {
-                        return _listItemTextRegular;
-                    }
-                }
-                else if (_listItemTextSelected is not null)
-                {
-                    return _listItemTextSelected;
-                }
+                string textMetadataColor = _singleton._options._listPredictionColor;
+                string newlineStyle = textMetadataColor + "\x1b[1m";
 
-                // Calculate the 'SOURCE' portion to be rendered.
+                string displayText = FlattenForDisplay(
+                    SuggestionText,
+                    InputMatchIndex,
+                    out int displayMatchIndex);
+
+                string commandLength = SuggestionText.Length.ToString();
+                commandLengthWidth = Math.Max(commandLengthWidth, commandLength.Length);
+
+                // Calculate the SOURCE portion to be rendered.
                 int sourceStrLen = Source.Length;
                 int sourceWidth = LengthInBufferCells(Source);
                 if (sourceWidth > PredictionListView.SourceMaxWidth)
@@ -117,275 +391,62 @@ namespace Microsoft.PowerShell
                     sourceStrLen = SubstringLengthByCells(Source, sourceWidth - ellipsisLength);
                 }
 
-                // Calculate the remaining width after deducting the ' [SOURCE]' portion and the leading '> ' part.
-                // 5 is the length of the decoration characters: "> ", " [", and ']'.
-                int textWidth = width - sourceWidth - 5;
-                string textMetadataColor = _singleton._options._listPredictionColor;
+                // Decorations are:
+                //   "> " + LENGTH + " │ " + ITEM + " [" + SOURCE + "]"
+                // which consumes 8 cells in addition to the length and source fields.
+                int textWidth = Math.Max(1, width - commandLengthWidth - sourceWidth - 8);
 
-                StringBuilder line = new StringBuilder(capacity: width)
+                var line = new StringBuilder(capacity: width + 32)
                     .Append(selectionHighlighting)
                     .Append(textMetadataColor)
                     .Append('>')
                     .EndColorSection(selectionHighlighting)
+                    .Append(' ')
+                    .Append(textMetadataColor)
+                    .Append(' ', commandLengthWidth - commandLength.Length)
+                    .Append(commandLength)
+                    .Append(" │")
+                    .EndColorSection(selectionHighlighting)
                     .Append(' ');
 
-                int textLengthInCells = LengthInBufferCells(SuggestionText);
-                if (textLengthInCells <= textWidth)
+                bool isMultiline = displayText.IndexOf(NewLineSentinel) >= 0;
+
+                var window = GetDisplayWindow(
+                    displayText,
+                    isMultiline ? 0 : displayMatchIndex,
+                    isMultiline ? 0 : input.Length,
+                    textWidth);
+
+                if (window.LeadingEllipsis)
                 {
-                    // Things are easy when the suggestion text can fit in the text width.
-                    switch (InputMatchIndex)
-                    {
-                        case -1:
-                            line.Append(SuggestionText);
-                            break;
-
-                        default: {
-                            int start = InputMatchIndex + input.Length;
-                            int length = SuggestionText.Length - start;
-                            line.Append(SuggestionText, 0, InputMatchIndex)
-                                .Append(_singleton._options.EmphasisColor)
-                                .Append(SuggestionText, InputMatchIndex, input.Length)
-                                .EndColorSection(selectionHighlighting)
-                                .Append(SuggestionText, start, length);
-                            break;
-                        }
-                    }
-
-                    // Do padding as necessary.
-                    int spacesNeeded = textWidth - textLengthInCells;
-                    if (spacesNeeded > 0)
-                    {
-                        line.Append(Spaces(spacesNeeded));
-                    }
+                    line.Append(Ellipsis);
                 }
-                else
+
+                AppendDisplaySlice(
+                    line,
+                    displayText,
+                    window.Start,
+                    window.Length,
+                    displayMatchIndex,
+                    input.Length,
+                    selectionHighlighting,
+                    newlineStyle);
+
+                if (window.TrailingEllipsis)
                 {
-                    // Things are more complicated when the suggestion text doesn't fit in the text width.
-                    switch (InputMatchIndex)
-                    {
-                        case -1: {
-                            // The suggestion text doesn't contain the user input.
-                            int length = SubstringLengthByCells(SuggestionText, textWidth - ellipsisLength);
-                            line.Append(SuggestionText, 0, length)
-                                .Append(Ellipsis);
-                            break;
-                        }
+                    line.Append(Ellipsis);
+                }
 
-                        case 0: {
-                            // The suggestion text starts with the user input, so we can divide the suggestion text into
-                            // the user input (left portion) and the prediction text (right portion).
-                            int inputLenInCells = LengthInBufferCells(input);
-                            if (inputLenInCells < textWidth / 2)
-                            {
-                                // If the user input portion takes less than half of the text width,
-                                // then we just truncate the suggestion text at the end.
-                                int length = SubstringLengthByCells(SuggestionText, textWidth - ellipsisLength);
-                                line.Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, 0, input.Length)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, input.Length, length - input.Length)
-                                    .Append(Ellipsis);
-                            }
-                            else
-                            {
-                                // We want to reserve 5 cells at least to display the trailing characters of the user input (the left portion).
-                                int rightLenInCells = LengthInBufferCells(SuggestionText, input.Length, SuggestionText.Length);
-                                if (rightLenInCells <= textWidth - ellipsisLength - 5)
-                                {
-                                    // If the prediction text (the right portion) can fit in the rest width, the list item
-                                    // will be rendered as '...LLLLLRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR'
-                                    int remainingLenInCells = textWidth - ellipsisLength - rightLenInCells;
-                                    int length = SubstringLengthByCellsFromEnd(SuggestionText, input.Length - 1, remainingLenInCells);
-                                    line.Append(_singleton._options.EmphasisColor)
-                                        .Append(Ellipsis)
-                                        .Append(SuggestionText, input.Length - length, length)
-                                        .EndColorSection(selectionHighlighting)
-                                        .Append(SuggestionText, input.Length, SuggestionText.Length - input.Length);
-                                }
-                                else
-                                {
-                                    // If the prediction text (the right portion) cannot fit in the rest width, the list
-                                    // item is rendered as '...LLLLLRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR...'
-                                    int leftStrLen = SubstringLengthByCellsFromEnd(SuggestionText, input.Length - 1, 5);
-                                    int startIndex = input.Length - leftStrLen;
-                                    int totalStrLen = SubstringLengthByCells(SuggestionText, startIndex, textWidth - ellipsisLength * 2);
-                                    line.Append(_singleton._options.EmphasisColor)
-                                        .Append(Ellipsis)
-                                        .Append(SuggestionText, startIndex, leftStrLen)
-                                        .EndColorSection(selectionHighlighting)
-                                        .Append(SuggestionText, input.Length, totalStrLen - leftStrLen)
-                                        .Append(Ellipsis);
-                                }
-                            }
+                int renderedTextWidth = LengthInBufferCells(
+                    displayText,
+                    window.Start,
+                    window.Start + window.Length)
+                    + (window.LeadingEllipsis ? 1 : 0)
+                    + (window.TrailingEllipsis ? 1 : 0);
 
-                            break;
-                        }
-
-                        default: {
-                            // The user input is contained in the middle or at the end of the suggestion text, so we can
-                            // divide the suggestion text into three portions:
-                            //  - prediction text on the left of the user input (left portion);
-                            //  - user input (mid portion);
-                            //  - prediction text on the right of the user input (right portion).
-                            int leftMidLenInCells = LengthInBufferCells(SuggestionText, 0, InputMatchIndex + input.Length);
-                            int rightStartindex = InputMatchIndex + input.Length;
-                            // Round up the 2/3 of the text width and use that as the threshold.
-                            int threshold = DivideAndRoundUp(textWidth * 2, 3);
-                            if (leftMidLenInCells <= threshold)
-                            {
-                                // If the (left+mid) portions take up to 2/3 of the text width, we just truncate the suggestion text at the end.
-                                int rightStrLen = SubstringLengthByCells(SuggestionText, rightStartindex, textWidth - leftMidLenInCells - ellipsisLength);
-                                line.Append(SuggestionText, 0, InputMatchIndex)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, input.Length)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, rightStrLen)
-                                    .Append(Ellipsis);
-                                break;
-                            }
-
-                            int midRightLenInCells = LengthInBufferCells(SuggestionText, InputMatchIndex, SuggestionText.Length);
-                            if (midRightLenInCells <= threshold)
-                            {
-                                // Otherwise, if the (mid+right) portions take up to 2/3 of the text width, we just truncate the suggestion text at the beginning.
-                                int leftStrLen = SubstringLengthByCellsFromEnd(SuggestionText, InputMatchIndex - 1, textWidth - midRightLenInCells - ellipsisLength);
-                                line.Append(Ellipsis)
-                                    .Append(SuggestionText, InputMatchIndex - leftStrLen, leftStrLen)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, input.Length)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, SuggestionText.Length - rightStartindex);
-                                break;
-                            }
-
-                            int midLenInCells = LengthInBufferCells(SuggestionText, InputMatchIndex, InputMatchIndex + input.Length);
-                            // Round up the 1/3 of the text width and use that as the threshold.
-                            threshold = DivideAndRoundUp(textWidth, 3);
-                            if (midLenInCells <= threshold)
-                            {
-                                // Otherwise, if the mid portion takes up to 1/3 of the text width, we truncate the suggestion text
-                                // at both the beginning and the end.
-                                int leftCellLen = (textWidth - midLenInCells) / 2;
-                                int rigthCellLen = textWidth - midLenInCells - leftCellLen;
-
-                                int leftStrLen = SubstringLengthByCellsFromEnd(SuggestionText, InputMatchIndex - 1, leftCellLen - ellipsisLength);
-                                int rightStrLen = SubstringLengthByCells(SuggestionText, rightStartindex, rigthCellLen - ellipsisLength);
-
-                                line.Append(Ellipsis)
-                                    .Append(SuggestionText, InputMatchIndex - leftStrLen, leftStrLen)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, input.Length)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, rightStrLen)
-                                    .Append(Ellipsis);
-                                break;
-                            }
-
-                            int leftPlusRightLenInCells = leftMidLenInCells + midRightLenInCells - midLenInCells * 2;
-                            if (leftPlusRightLenInCells <= textWidth - 7)
-                            {
-                                // Otherwise, the mid portion is relatively too long. In this case, if the (left+right) portions are not
-                                // too long -- namely we can reserve 7 cells at least for the mid portion, including '...' -- then let's
-                                // render the list item text as: 'LLLLLLLLLLLLLLLLLLMM...MMRRRRRRRRRRRRRRRRRR'
-                                int midRemainingLenInCells = textWidth - leftPlusRightLenInCells - ellipsisLength;
-                                int midLeftCellLen = midRemainingLenInCells / 2;
-                                int midRightCellLen = midRemainingLenInCells - midLeftCellLen;
-
-                                int midLeftStrLen = SubstringLengthByCells(SuggestionText, InputMatchIndex, midLeftCellLen);
-                                int midRightStrLen = SubstringLengthByCellsFromEnd(SuggestionText, rightStartindex - 1, midRightCellLen);
-
-                                line.Append(SuggestionText, 0, InputMatchIndex)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, midLeftStrLen)
-                                    .Append(Ellipsis)
-                                    .Append(SuggestionText, rightStartindex - midRightStrLen, midRightStrLen)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, SuggestionText.Length - rightStartindex);
-                                break;
-                            }
-
-                            // If we reach here, then we know that the mid portion takes longer than 1/3 of the text width,
-                            // and the (left+right) portions takes pretty long too, very likely close to the text width.
-                            int leftLenInCells = leftMidLenInCells - midLenInCells;
-                            int rightLenInCells = midRightLenInCells - midLenInCells;
-
-                            if (leftLenInCells <= threshold)
-                            {
-                                // If the left portion is less than or equal to 1/3 of the text width, then we display the whole left portion,
-                                // reserve 1/3 of the text width to the mid portion, and the rest width is for the right portion. So the list
-                                // item text looks like: 'LLLLLLLLLMMMMMMMM...MMMMMMMMRRRRRRRRRRRRRRRRRRRRR...'
-                                int midRemainingLenInCells = textWidth / 3 - ellipsisLength;
-                                int midLeftCellLen = midRemainingLenInCells / 2;
-                                int midRightCellLen = midRemainingLenInCells - midLeftCellLen;
-
-                                int midLeftStrLen = SubstringLengthByCells(SuggestionText, InputMatchIndex, midLeftCellLen);
-                                int midRightStrLen = SubstringLengthByCellsFromEnd(SuggestionText, rightStartindex - 1, midRightCellLen);
-                                int rightStrLen = SubstringLengthByCells(SuggestionText, rightStartindex, midRemainingLenInCells);
-
-                                line.Append(SuggestionText, 0, InputMatchIndex)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, midLeftStrLen)
-                                    .Append(Ellipsis)
-                                    .Append(SuggestionText, rightStartindex - midRightStrLen, midRightStrLen)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, rightStrLen)
-                                    .Append(Ellipsis);
-                                break;
-                            }
-
-                            if (rightLenInCells <= threshold)
-                            {
-                                // Similarly, if the right portion is less than or equal to 1/3 of the text width, then we display the whole
-                                // right portion, reserve 1/3 of the text width to the mid portion, and the rest width is for the left portion.
-                                // So the list item text looks like: '...LLLLLLLLLLLLLLLLMMMMMMMM...MMMMMMMMRRRRRRRRRRRRRR'
-                                int midRemainingLenInCells = textWidth / 3 - ellipsisLength;
-                                int midLeftCellLen = midRemainingLenInCells / 2;
-                                int midRightCellLen = midRemainingLenInCells - midLeftCellLen;
-
-                                int midLeftStrLen = SubstringLengthByCells(SuggestionText, InputMatchIndex, midLeftCellLen);
-                                int midRightStrLen = SubstringLengthByCellsFromEnd(SuggestionText, rightStartindex - 1, midRightCellLen);
-                                int leftStrLen = SubstringLengthByCellsFromEnd(SuggestionText, InputMatchIndex - 1, midRemainingLenInCells);
-
-                                line.Append(Ellipsis)
-                                    .Append(SuggestionText, InputMatchIndex - leftStrLen, leftStrLen)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, midLeftStrLen)
-                                    .Append(Ellipsis)
-                                    .Append(SuggestionText, rightStartindex - midRightStrLen, midRightStrLen)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, SuggestionText.Length - rightStartindex);
-                                break;
-                            }
-
-                            {
-                                // All left, mid, and right portions take longer than 1/3 of the text width. We assign 1/3 of the text width
-                                // to each of them equally in this case, so the list item text looks like:
-                                //   '...LLLLLLLLLLLLLLMMMMMMMM...MMMMMMMMRRRRRRRRRRRRRRRR...'
-                                int midRemainingLenInCells = textWidth / 3 - ellipsisLength;
-                                int midLeftCellLen = midRemainingLenInCells / 2;
-                                int midRightCellLen = midRemainingLenInCells - midLeftCellLen;
-
-                                int midLeftStrLen = SubstringLengthByCells(SuggestionText, InputMatchIndex, midLeftCellLen);
-                                int midRightStrLen = SubstringLengthByCellsFromEnd(SuggestionText, rightStartindex - 1, midRightCellLen);
-                                int leftStrLen = SubstringLengthByCellsFromEnd(SuggestionText, InputMatchIndex - 1, midRemainingLenInCells);
-                                int rightStrLen = SubstringLengthByCells(SuggestionText, rightStartindex, midRemainingLenInCells);
-                                int spacesNeeded = textWidth - midRemainingLenInCells * 3 - ellipsisLength * 3;
-                                string spaces = spacesNeeded > 0 ? Spaces(spacesNeeded) : string.Empty;
-
-                                line.Append(Ellipsis)
-                                    .Append(SuggestionText, InputMatchIndex - leftStrLen, leftStrLen)
-                                    .Append(_singleton._options.EmphasisColor)
-                                    .Append(SuggestionText, InputMatchIndex, midLeftStrLen)
-                                    .Append(Ellipsis)
-                                    .Append(SuggestionText, rightStartindex - midRightStrLen, midRightStrLen)
-                                    .EndColorSection(selectionHighlighting)
-                                    .Append(SuggestionText, rightStartindex, rightStrLen)
-                                    .Append(Ellipsis)
-                                    .Append(spaces);
-                                break;
-                            }
-                        }
-                    }
+                if (renderedTextWidth < textWidth)
+                {
+                    line.Append(Spaces(textWidth - renderedTextWidth));
                 }
 
                 line.Append(' ')
@@ -407,21 +468,10 @@ namespace Microsoft.PowerShell
 
                 if (selectionHighlighting is not null)
                 {
-                    // Need to reset at the end if the selection highlighting is being applied.
                     line.Append(VTColorUtils.AnsiReset);
                 }
 
-                string textForRendering = line.ToString();
-                if (selectionHighlighting is null)
-                {
-                    _listItemTextRegular = textForRendering;
-                }
-                else
-                {
-                    _listItemTextSelected = textForRendering;
-                }
-
-                return textForRendering;
+                return line.ToString();
             }
         }
     }

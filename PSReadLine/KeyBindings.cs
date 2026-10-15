@@ -544,6 +544,7 @@ namespace Microsoft.PowerShell
 
             case nameof(BeginningOfHistory):
             case nameof(ClearHistory):
+            case nameof(DeleteHistorySuggestion):
             case nameof(EndOfHistory):
             case nameof(ForwardSearchHistory):
             case nameof(HistorySearchBackward):

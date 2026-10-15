@@ -817,6 +817,126 @@ namespace Microsoft.PowerShell
             _singleton._currentHistoryIndex = 0;
         }
 
+        public bool RemoveHistoryItem(HistoryItem item)
+        {
+            if (item is null || _history is null)
+            {
+                return false;
+            }
+
+            bool removed = false;
+
+            bool succeeded = WithHistoryFileMutexDo(1000, () =>
+            {
+                // Incorporate anything another PowerShell process appended before we
+                // rewrite the history file, while holding the same file mutex.
+                if (_options.HistorySaveStyle != HistorySaveStyle.SaveNothing)
+                {
+                    List<string> historyLines = ReadHistoryFileIncrementally();
+                    if (historyLines is not null)
+                    {
+                        UpdateHistoryFromFile(
+                            historyLines,
+                            fromDifferentSession: true,
+                            fromInitialRead: false);
+                    }
+                }
+
+                HistoryItem[] items = _history.ToArray();
+                int removeIndex = Array.IndexOf(items, item);
+
+                if (removeIndex < 0)
+                {
+                    return;
+                }
+
+                _history.Clear();
+
+                for (int i = 0; i < items.Length; i++)
+                {
+                    if (i != removeIndex)
+                    {
+                        _history.Enqueue(items[i]);
+                    }
+                }
+
+                if (_currentHistoryIndex > removeIndex)
+                {
+                    _currentHistoryIndex--;
+                }
+
+                _currentHistoryIndex = Math.Min(_currentHistoryIndex, _history.Count);
+
+                if (_getNextHistoryIndex > removeIndex)
+                {
+                    _getNextHistoryIndex--;
+                }
+
+                _getNextHistoryIndex = Math.Min(_getNextHistoryIndex, _history.Count);
+
+                _hashedHistory = null;
+
+                if (ReferenceEquals(_previousHistoryItem, item))
+                {
+                    _previousHistoryItem = null;
+                }
+
+                // Reconstruct the small recent-history queue from surviving commands
+                // belonging to this PowerShell session.
+                _recentHistory.Clear();
+
+                var recent = new List<string>();
+                for (int i = 0; i < _history.Count; i++)
+                {
+                    HistoryItem historyItem = _history[i];
+
+                    if (!historyItem.FromHistoryFile && !historyItem.FromOtherSession)
+                    {
+                        recent.Add(historyItem.CommandLine);
+                    }
+                }
+
+                int recentStart = Math.Max(0, recent.Count - 5);
+                for (int i = recentStart; i < recent.Count; i++)
+                {
+                    _recentHistory.Enqueue(recent[i]);
+                }
+
+                if (_options.HistorySaveStyle != HistorySaveStyle.SaveNothing)
+                {
+                    string directory = Path.GetDirectoryName(Options.HistorySavePath);
+                    if (!string.IsNullOrEmpty(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
+                    using (var file = File.CreateText(Options.HistorySavePath))
+                    {
+                        for (int i = 0; i < _history.Count; i++)
+                        {
+                            HistoryItem historyItem = _history[i];
+                            historyItem._saved = true;
+
+                            if (historyItem._sensitive)
+                            {
+                                continue;
+                            }
+
+                            string line = historyItem.CommandLine.Replace("\n", "`\n");
+                            file.WriteLine(line);
+                        }
+                    }
+
+                    _historyFileLastSavedSize =
+                        new FileInfo(Options.HistorySavePath).Length;
+                }
+
+                removed = true;
+            });
+
+            return succeeded && removed;
+        }
+
         /// <summary>
         /// Return a collection of history items.
         /// </summary>
